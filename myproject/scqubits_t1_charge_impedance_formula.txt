@@ -1,0 +1,79 @@
+================================================================================
+scqubits Transition Rate 計算公式與原始碼來源說明
+================================================================================
+
+本文件詳細說明 scqubits 套件中計算 qubit 耦合到電阻/阻抗環境 (Charge Coupling to Impedance)
+之躍遷率 (Transition Rate) / T1 弛豫率與激發率的數學公式，以及程式碼對應位置。
+
+--------------------------------------------------------------------------------
+1. 檔案位置與核心函式 (File Locations)
+--------------------------------------------------------------------------------
+相關原始碼皆位於 scqubits 專案的以下檔案中：
+相對路徑：scqubits/core/noise.py
+
+關鍵函式與常數定義位置：
+- 常數 R_k (Klitzing Constant):
+  檔案位置: scqubits/core/noise.py, 第 104-105 行
+  定義內容: CONSTANTS["R_k"] = h / e^2 (約 25812.807 Ohm)
+
+- 熱能量比值計算 calc_therm_ratio(omega, T):
+  檔案位置: scqubits/core/noise.py, 第 48-72 行
+  定義內容: \beta * \omega = (hbar * \omega) / (k_B * T)
+
+- 阻抗噪聲功率譜密度與 t1_charge_impedance():
+  檔案位置: scqubits/core/noise.py, 第 1386-1480 行
+
+- 通用費米黃金律躍遷率計算 t1():
+  檔案位置: scqubits/core/noise.py, 第 1185-1285 行
+
+
+--------------------------------------------------------------------------------
+2. 數學公式與計算步驟 (Mathematical Formulas)
+--------------------------------------------------------------------------------
+
+(A) 躍遷角頻率 \omega_{ij}:
+    \omega_{ij} = 2 * \pi * (E_i - E_j)
+    其中 E_i, E_j 為量子位元在系統單位 (預設為 GHz) 下的特徵能量。
+    當計算衰減 (i > j, 如 3->0) 時, \omega_{ij} > 0;
+    當計算激發 (i < j, 如 0->3) 時, \omega_{ij} < 0。
+
+(B) 等效品質因子 Q_c (微觀阻抗參數化):
+    位於 noise.py 第 1441 行：
+    Q_c = R_k / (8 * \pi * Re[Z(\omega_{ij})])
+    其中 R_k = h / e^2 為 von Klitzing 常數，Re[Z(\omega)] 為環境在該頻率下的實部阻抗 (Ohm)。
+
+(C) 電壓噪聲功率譜密度 S(\omega):
+    位於 noise.py 第 1442-1449 行：
+    S(\omega) = \frac{2 \omega}{Q_c} * \frac{1}{\tanh(0.5 * \beta \omega)} * \frac{1}{1 + e^{-\beta \omega}}
+
+    透過恆等式 \frac{1}{\tanh(x/2)} = \frac{1 + e^{-x}}{1 - e^{-x}}，公式可簡化為標準熱噪聲形式：
+    S(\omega) = \frac{2 \omega}{Q_c} * \frac{1}{1 - e^{-\beta \omega}}
+              = \frac{16 \pi \cdot Re[Z(\omega)] \cdot \omega}{R_k} * \frac{1}{1 - e^{-\hbar \omega / (k_B T)}}
+
+(D) 費米黃金律 (Fermi's Golden Rule) 躍遷率 \Gamma_{i \to j}:
+    位於 noise.py 第 1261-1275 行：
+    \Gamma_{i \to j} = |\langle i | n | j \rangle|^2 * S(\omega_{ij})
+
+    其中：
+    - n 為電荷算符 n = Q / (2e) (即 fl.n_operator())
+    - \langle i | n | j \rangle 為能級 i 到 j 的電荷算符矩陣元素
+    - 當設定 total=False 且 get_rate=True 時，回傳單向躍遷率 \Gamma_{i \to j}
+
+(E) 單位轉換 (Units):
+    scqubits 回傳的 rate 單位為系統頻率單位 (GHz)。
+    若要換算為 MHz，需乘以 10^3 (即 1 GHz = 1000 MHz)。
+
+
+--------------------------------------------------------------------------------
+3. 與原作者 (Cattaneo 2021) 公式之物理等價性說明
+--------------------------------------------------------------------------------
+在 fluxonium_bpf.py 中，使用的公式為：
+\Gamma_{i \to j} = (2e / hbar)^2 * |\langle i | n | j \rangle|^2 * S_{VV}(\omega_{ij})
+其中 S_{VV}(\omega) = \frac{2 \hbar \omega}{1 - e^{-\hbar \omega / (k_B T)}} * Re[Z(\omega)]
+
+代入 (2e / hbar)^2 * S_{VV}(\omega)：
+(2e / hbar)^2 * 2 \hbar \omega * Re[Z(\omega)] = \frac{8 e^2 \omega}{\hbar} * Re[Z(\omega)]
+                                                  = \frac{16 \pi e^2 \omega}{h} * Re[Z(\omega)]
+                                                  = \frac{16 \pi Re[Z(\omega)] \omega}{R_k}
+
+與 scqubits 的 S(\omega) 完全一模一樣！因此兩者物理結果在機器精度範圍內完全吻合。
