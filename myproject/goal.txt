@@ -1,0 +1,1 @@
+目的是找到最佳的theta，其中Omega_p=Omega*sin(theta), Omega_s=Omega*cos(theta)
