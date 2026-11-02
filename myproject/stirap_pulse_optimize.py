@@ -329,6 +329,42 @@ def flat_top_gaussian_envelope(
 
 
 # ---------------------------------------------------------------------------
+# Omega Iteration from Theta
+# ---------------------------------------------------------------------------
+def update_omega_from_theta(
+    Omega: np.ndarray,
+    theta: np.ndarray,
+    n03: float,
+    n32: float,
+    *,
+    eps: float = 1e-12,
+) -> np.ndarray:
+    """Update Omega envelope using theta and transition dipole matrix elements.
+
+    Correction formula:
+        Omega_new = Omega * min( (n03 / n32) / sin(theta), 1 / cos(theta) )
+
+    Numerical protection with `eps` prevents division by zero at endpoints
+    (e.g., sin(theta)=0 at theta=0 or cos(theta)=0 at theta=pi/2).
+    """
+    Omega = np.asarray(Omega, dtype=float)
+    theta = np.asarray(theta, dtype=float)
+    if Omega.shape != theta.shape:
+        raise ValueError(
+            f"Omega and theta must have the same shape, got {Omega.shape} and {theta.shape}."
+        )
+    if n03 <= 0.0 or n32 <= 0.0:
+        raise ValueError("n03 and n32 must be strictly positive.")
+
+    sin_theta = np.maximum(np.sin(theta), eps)
+    cos_theta = np.maximum(np.cos(theta), eps)
+    term1 = (n03 / n32) / sin_theta
+    term2 = 1.0 / cos_theta
+    factor = np.minimum(term1, term2)
+    return Omega * factor
+
+
+# ---------------------------------------------------------------------------
 # Numerical integration utilities (composite trapezoidal rule)
 # ---------------------------------------------------------------------------
 def trapezoid_weights(t: np.ndarray) -> np.ndarray:
@@ -844,6 +880,7 @@ def save_iteration_data(
 def optimize_flat_top_pulse(
     fidelity_fn: Callable[[np.ndarray, np.ndarray, float], float],
     *,
+    Omega_initial: Optional[np.ndarray] = None,
     T_ns: float = T_NS,
     omega0_over_2pi_mhz: float = OMEGA0_OVER_2PI_MHZ,
     max_degree: int = 6,
@@ -863,6 +900,9 @@ def optimize_flat_top_pulse(
     fidelity_fn:
         User's function: fidelity_fn(Omega_array, theta_array, T_ns) -> scalar.
         The two arrays have shape (n_time,) and correspond to t_ns.
+    Omega_initial:
+        Optional precomputed Omega array (shape n_time). If None, generates
+        the default flat-top Gaussian envelope.
     max_degree:
         Highest Legendre seed degree. There are max_degree free coefficients
         a_1,...,a_N; a_0 is fixed by the integral constraint.
@@ -881,13 +921,18 @@ def optimize_flat_top_pulse(
     omega0_rad_ns = 2.0 * np.pi * (omega0_over_2pi_mhz * 1e-3)
     rise_time_ns, sigma_ns = ramp_calibration(omega0_over_2pi_mhz)
 
-    Omega = flat_top_gaussian_envelope(
-        t_ns=t_ns,
-        T_ns=T_ns,
-        omega0_rad_ns=omega0_rad_ns,
-        rise_time_ns=rise_time_ns,
-        sigma_ns=sigma_ns,
-    )
+    if Omega_initial is not None:
+        Omega = np.asarray(Omega_initial, dtype=float).copy()
+        if Omega.shape != t_ns.shape:
+            raise ValueError(f"Omega_initial shape {Omega.shape} must match t_ns shape {t_ns.shape}.")
+    else:
+        Omega = flat_top_gaussian_envelope(
+            t_ns=t_ns,
+            T_ns=T_ns,
+            omega0_rad_ns=omega0_rad_ns,
+            rise_time_ns=rise_time_ns,
+            sigma_ns=sigma_ns,
+        )
     basis = build_weighted_legendre_basis(t_ns, Omega, max_degree)
 
     if initial_coefficients is None:
@@ -948,6 +993,150 @@ def optimize_flat_top_pulse(
         "sigma_ns": sigma_ns,
         "endpoint_constraint_value": endpoint_constraint,
         "theta_T": endpoint_angle,
+    }
+
+
+def optimize_stirap_with_iterative_omega(
+    fidelity_fn: Callable[[np.ndarray, np.ndarray, float], float],
+    *,
+    T_ns: float = T_NS,
+    omega0_over_2pi_mhz: float = OMEGA0_OVER_2PI_MHZ,
+    max_degree: int = 6,
+    n_time: int = 2001,
+    n_outer_iterations: int = 10,
+    ramp_calibration: Callable[[float], tuple[float, float]] = power_law_ramp_calibration,
+    optimizer: Callable[..., OptimizationResult] = gradient_ascent,
+    stage_configs: Optional[list[dict[str, Any]]] = None,
+    save_step: int = 1,
+    output_dir: str = "optimization_history",
+    system_cache: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Iteratively optimize theta and update Omega self-consistently over multiple rounds.
+
+    Formula for updating Omega:
+        Omega_new = Omega * min((n03 / n32) / sin(theta), 1 / cos(theta))
+
+    Default 10-round schedule:
+      - Rounds 1-3 (outer_iter 0, 1, 2): Coarse tuning (max_iter=15, grad_tol=1e-4) to settle Omega shape.
+      - Rounds 4-6 (outer_iter 3, 4, 5): Medium tuning (max_iter=30, grad_tol=1e-5).
+      - Rounds 7-10 (outer_iter 6, 7, 8, 9): Fine tuning (max_iter=50, grad_tol=1e-7) to maximize fidelity.
+
+    Each outer round resets initial coefficients to all zeros and rebuilds the
+    weighted Legendre basis on the newly modified Omega envelope.
+    """
+    if system_cache is None:
+        system_cache = get_stirap_system_cache()
+
+    n03 = float(system_cache["n03"])
+    n32 = float(system_cache["n32"])
+
+    # Configure stages for each outer iteration if not provided
+    if stage_configs is None:
+        stage_configs = []
+        for r in range(n_outer_iterations):
+            if r < 3:
+                # Rounds 1-3: coarse tuning
+                stage_configs.append({"max_iter": 15, "grad_tol": 1e-4, "learning_rate": 0.1})
+            elif r < 6:
+                # Rounds 4-6: medium tuning
+                stage_configs.append({"max_iter": 30, "grad_tol": 1e-5, "learning_rate": 0.1})
+            else:
+                # Rounds 7-10: fine tuning
+                stage_configs.append({"max_iter": 50, "grad_tol": 1e-7, "learning_rate": 0.1})
+    elif len(stage_configs) < n_outer_iterations:
+        last_config = stage_configs[-1]
+        for _ in range(len(stage_configs), n_outer_iterations):
+            stage_configs.append(dict(last_config))
+
+    t_ns = np.linspace(0.0, T_ns, n_time)
+    omega0_rad_ns = 2.0 * np.pi * (omega0_over_2pi_mhz * 1e-3)
+    rise_time_ns, sigma_ns = ramp_calibration(omega0_over_2pi_mhz)
+
+    current_Omega = flat_top_gaussian_envelope(
+        t_ns=t_ns,
+        T_ns=T_ns,
+        omega0_rad_ns=omega0_rad_ns,
+        rise_time_ns=rise_time_ns,
+        sigma_ns=sigma_ns,
+    )
+
+    outer_results: list[dict[str, Any]] = []
+
+    print("\n" + "=" * 75)
+    print(f"STARTING SELF-CONSISTENT OMEGA-THETA ITERATION ({n_outer_iterations} ROUNDS)")
+    print(f"Dipole matrix elements: n03 = {n03:.6f}, n32 = {n32:.6f}, ratio = {n03/n32:.6f}")
+    print("=" * 75)
+
+    for outer_idx in range(n_outer_iterations):
+        stage_name = (
+            "Coarse tuning" if outer_idx < 3 else ("Medium tuning" if outer_idx < 6 else "Fine tuning")
+        )
+        stage_kwargs = dict(stage_configs[outer_idx])
+        round_dir = os.path.join(output_dir, f"outer_round_{outer_idx + 1:02d}")
+
+        print(f"\n>>> [Round {outer_idx + 1:02d}/{n_outer_iterations:02d}] {stage_name} "
+              f"(max_iter={stage_kwargs.get('max_iter', 50)}, grad_tol={stage_kwargs.get('grad_tol', 1e-7)})")
+
+        round_result = optimize_flat_top_pulse(
+            fidelity_fn=fidelity_fn,
+            Omega_initial=current_Omega,
+            T_ns=T_ns,
+            omega0_over_2pi_mhz=omega0_over_2pi_mhz,
+            max_degree=max_degree,
+            n_time=n_time,
+            ramp_calibration=ramp_calibration,
+            optimizer=optimizer,
+            optimizer_kwargs=stage_kwargs,
+            initial_coefficients=np.zeros(max_degree, dtype=float),
+            save_step=save_step,
+            output_dir=round_dir,
+            system_cache=system_cache,
+        )
+
+        current_theta = round_result["theta"]
+        outer_results.append({
+            "round": outer_idx + 1,
+            "stage": stage_name,
+            "fidelity": round_result["fidelity"],
+            "Omega": current_Omega.copy(),
+            "theta": current_theta.copy(),
+            "result": round_result,
+        })
+
+        print(f">>> [Round {outer_idx + 1:02d} Completed] Fidelity = {round_result['fidelity']:.8f}")
+
+        # Update Omega for the next round using the formula
+        if outer_idx < n_outer_iterations - 1:
+            new_Omega = update_omega_from_theta(
+                Omega=current_Omega,
+                theta=current_theta,
+                n03=n03,
+                n32=n32,
+            )
+            # Log change in Omega envelope
+            max_diff = float(np.max(np.abs(new_Omega - current_Omega)))
+            rel_diff = max_diff / float(np.max(current_Omega))
+            print(f">>> [Omega Updated] max|Omega_new - Omega_old| = {max_diff:.4e} rad/ns (relative {rel_diff*100:.2f}%)")
+            current_Omega = new_Omega
+
+    last_res = outer_results[-1]["result"]
+    return {
+        "t_ns": t_ns,
+        "Omega": current_Omega,
+        "theta": last_res["theta"],
+        "eta": last_res["eta"],
+        "coefficients": last_res["coefficients"],
+        "fidelity": last_res["fidelity"],
+        "optimization": last_res["optimization"],
+        "basis": last_res["basis"],
+        "basis_data": last_res["basis_data"],
+        "W": last_res["W"],
+        "omega0_rad_ns": omega0_rad_ns,
+        "rise_time_ns": rise_time_ns,
+        "sigma_ns": sigma_ns,
+        "endpoint_constraint_value": last_res["endpoint_constraint_value"],
+        "theta_T": last_res["theta_T"],
+        "outer_history": outer_results,
     }
 
 
@@ -1052,28 +1241,36 @@ if __name__ == "__main__":
     stirap_fidelity_objective = StirapFidelityObjective(env_type=env_type, T_kelvin=0.030)
 
 
-    # 3. Run optimization with multi-core parallel gradient evaluation
+    # 3. Run self-consistent iterative optimization (10 rounds)
     max_cores = mp.cpu_count()
     save_step = 1  # Save CSV and plots every save_step iterations (1 = every iteration)
     history_dir = "optimization_history"
-    print(f"Optimizing weighted Legendre pulse coefficients using {max_cores} CPU cores...")
+    n_outer_iterations = 10
+    print(f"Starting 10-round iterative optimization using {max_cores} CPU cores...")
+    print(f"Rounds 1-3: coarse tuning | Rounds 4-6: medium tuning | Rounds 7-10: fine tuning")
     print(f"Saving pulse CSV, pulse plot, and 3-level population plot every {save_step} iteration(s) to '{history_dir}'...")
 
-    result = optimize_flat_top_pulse(
+    # Stage configs for 10 rounds
+    stage_configs = []
+    for r in range(n_outer_iterations):
+        if r < 3:
+            stage_configs.append({"max_iter": 15, "grad_tol": 1e-4, "learning_rate": 0.1, "max_workers": max_cores, "verbose": True})
+        elif r < 6:
+            stage_configs.append({"max_iter": 30, "grad_tol": 1e-5, "learning_rate": 0.1, "max_workers": max_cores, "verbose": True})
+        else:
+            stage_configs.append({"max_iter": 50, "grad_tol": 1e-7, "learning_rate": 0.1, "max_workers": max_cores, "verbose": True})
+
+    result = optimize_stirap_with_iterative_omega(
         fidelity_fn=stirap_fidelity_objective,
         T_ns=T_NS,
         omega0_over_2pi_mhz=OMEGA0_OVER_2PI_MHZ,
         max_degree=6,
         n_time=2001,
+        n_outer_iterations=n_outer_iterations,
+        stage_configs=stage_configs,
         save_step=save_step,
         output_dir=history_dir,
         system_cache=system_cache,
-        optimizer_kwargs={
-            "learning_rate": 0.1,
-            "max_iter": 50,
-            "max_workers": max_cores,
-            "verbose": True,
-        },
     )
 
     t_grid = result["t_ns"]
