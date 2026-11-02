@@ -23,14 +23,15 @@ from typing import Callable, Optional, Any
 import os
 import sys
 import multiprocessing as mp
+import concurrent.futures
 
 # Set thread environment variables before linear algebra libraries load
 # to ensure maximum parallel efficiency across CPU cores in multiprocessing.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 import numpy as np
 from numpy.polynomial.legendre import legvander
@@ -486,6 +487,45 @@ def _parallel_worker_evaluate(point: np.ndarray) -> float:
     return float(_PARALLEL_OBJECTIVE(point))
 
 
+def parallel_evaluate_points(
+    objective: Callable[[np.ndarray], float],
+    points: list[np.ndarray],
+    max_workers: Optional[int] = None,
+) -> list[float]:
+    """Cross-platform parallel evaluation of an objective function over a list of points.
+
+    Supports both POSIX systems (Linux, macOS via 'fork') and Windows (via thread pool
+    or fallback) seamlessly, avoiding platform-specific context errors.
+    """
+    global _PARALLEL_OBJECTIVE
+    if max_workers is None:
+        max_workers = mp.cpu_count()
+
+    if max_workers <= 1 or len(points) <= 1:
+        return [float(objective(p)) for p in points]
+
+    available_methods = mp.get_all_start_methods()
+    # On Linux and macOS, 'fork' allows fast copy-on-write without pickling issues
+    if "fork" in available_methods:
+        try:
+            _PARALLEL_OBJECTIVE = objective
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=max_workers) as pool:
+                return pool.map(_parallel_worker_evaluate, points)
+        except Exception:
+            pass
+        finally:
+            _PARALLEL_OBJECTIVE = None
+
+    # On Windows or systems where fork is unavailable/fails, use multi-threading
+    # which works on Windows without process spawning or pickling limitations.
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            return list(executor.map(objective, points))
+    except Exception:
+        return [float(objective(p)) for p in points]
+
+
 def finite_difference_gradient(
     objective: Callable[[np.ndarray], float],
     x: np.ndarray,
@@ -493,7 +533,6 @@ def finite_difference_gradient(
     max_workers: Optional[int] = None,
 ) -> np.ndarray:
     """Central finite-difference gradient of a scalar objective with multi-core parallel evaluation."""
-    global _PARALLEL_OBJECTIVE
     x = np.asarray(x, dtype=float)
     dim = x.size
     if dim == 0:
@@ -510,21 +549,7 @@ def finite_difference_gradient(
         eval_points.append(xp)
         eval_points.append(xm)
 
-    if max_workers is None:
-        max_workers = mp.cpu_count()
-
-    if max_workers > 1 and len(eval_points) > 1:
-        # Use fork-based pool and a top-level worker function so closures/lambdas
-        # are inherited via copy-on-write without pickling errors.
-        _PARALLEL_OBJECTIVE = objective
-        try:
-            ctx = mp.get_context("fork")
-            with ctx.Pool(processes=max_workers) as pool:
-                vals = pool.map(_parallel_worker_evaluate, eval_points)
-        finally:
-            _PARALLEL_OBJECTIVE = None
-    else:
-        vals = [float(objective(p)) for p in eval_points]
+    vals = parallel_evaluate_points(objective, eval_points, max_workers=max_workers)
 
     grad = np.zeros(dim, dtype=float)
     for i in range(dim):
@@ -547,10 +572,12 @@ def gradient_ascent(
     min_step: float = 1e-8,
     max_workers: Optional[int] = None,
     verbose: bool = True,
+    callback: Optional[Callable[[int, np.ndarray, float], None]] = None,
 ) -> OptimizationResult:
     """Maximize objective using finite-difference gradient ascent + line search.
 
     Monitors progress and computes finite-difference gradient in parallel using max CPU cores.
+    Optionally invokes callback(iteration, x, fidelity) at iteration 0 and after every step.
     """
     x = np.asarray(x0, dtype=float).copy()
     if x.ndim != 1:
@@ -571,6 +598,13 @@ def gradient_ascent(
 
     if verbose:
         print(f"[Optimizer] Iteration 0 | Initial Fidelity = {f:.8f} | Coefficients = {x}")
+
+    if callback is not None:
+        try:
+            callback(0, x, f)
+        except Exception as e:
+            if verbose:
+                print(f"[Optimizer] Warning in callback at iteration 0: {e}")
 
     if x.size == 0:
         return OptimizationResult(x, f, 0, True, "No free coefficients (N=0).", history)
@@ -638,6 +672,13 @@ def gradient_ascent(
                 f"Coeffs = {np.round(x, 5)}"
             )
 
+        if callback is not None:
+            try:
+                callback(iteration, x, f)
+            except Exception as e:
+                if verbose:
+                    print(f"[Optimizer] Warning in callback at iteration {iteration}: {e}")
+
     msg = "Reached max_iter before convergence."
     if verbose:
         print(f"[Optimizer] {msg}")
@@ -647,6 +688,123 @@ def gradient_ascent(
 # ---------------------------------------------------------------------------
 # Top-level optimization wrapper
 # ---------------------------------------------------------------------------
+def save_iteration_data(
+    iteration: int,
+    t_grid: np.ndarray,
+    Omega: np.ndarray,
+    theta: np.ndarray,
+    fidelity: float,
+    *,
+    coefficients: Optional[np.ndarray] = None,
+    output_dir: str = "optimization_history",
+    system_cache: Optional[dict[str, Any]] = None,
+) -> None:
+    """Save pulse CSV, results TXT, and plots of pulse envelopes and populations for an iteration."""
+    os.makedirs(output_dir, exist_ok=True)
+    if system_cache is None:
+        system_cache = get_stirap_system_cache()
+
+    Omega_p = Omega * np.sin(theta)
+    Omega_s = Omega * np.cos(theta)
+
+    # 1. Save Pulse Envelopes to CSV
+    Omega_p_mhz = Omega_p / (2.0 * np.pi * 1e-3)
+    Omega_s_mhz = Omega_s / (2.0 * np.pi * 1e-3)
+    Omega_mhz = Omega / (2.0 * np.pi * 1e-3)
+
+    csv_path = os.path.join(output_dir, f"pulse_iter_{iteration:03d}.csv")
+    pulse_table = np.column_stack(
+        [t_grid, Omega, theta, Omega_s, Omega_p, Omega_mhz, Omega_s_mhz, Omega_p_mhz]
+    )
+    header = (
+        "time_ns,Omega_rad_ns,theta_rad,Omega_s_rad_ns,Omega_p_rad_ns,"
+        "Omega_mhz,Omega_s_mhz,Omega_p_mhz"
+    )
+    np.savetxt(csv_path, pulse_table, delimiter=",", header=header, comments="", fmt="%.8e")
+
+    # 2. Simulate 3-level & other population dynamics
+    N = system_cache["N"]
+    P0 = qt.basis(N, 0).proj()
+    P2 = qt.basis(N, 2).proj()
+    P3 = qt.basis(N, 3).proj()
+    P_other = qt.qeye(N) - P0 - P2 - P3
+
+    sim_res = simulate_stirap_arbitrary_pulse(
+        t_grid=t_grid,
+        Omega_p=Omega_p,
+        Omega_s=Omega_s,
+        system_cache=system_cache,
+        e_ops=[P0, P3, P2, P_other],
+    )
+    P0_t, P3_t, P2_t, Pother_t = [np.real(np.asarray(x)) for x in sim_res.expect]
+
+    final_P0 = float(P0_t[-1])
+    final_P2 = float(P2_t[-1])
+    final_P3 = float(P3_t[-1])
+    final_Pother = float(Pother_t[-1])
+    p3_max = float(np.max(P3_t))
+
+    # 3. Save Results Summary to TXT
+    txt_path = os.path.join(output_dir, f"results_iter_{iteration:03d}.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("=" * 60 + "\n")
+        f.write(f"STIRAP ITERATION {iteration:03d} RESULTS\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Iteration:     {iteration}\n")
+        f.write(f"Fidelity (P2): {final_P2:.8f}\n")
+        f.write(f"Final P0:      {final_P0:.8f}\n")
+        f.write(f"Final P2:      {final_P2:.8f}\n")
+        f.write(f"Final P3:      {final_P3:.8f}\n")
+        f.write(f"Final P_other: {final_Pother:.8f}\n")
+        f.write(f"P3_max:        {p3_max:.8f}\n")
+        f.write(f"theta(0):      {theta[0]:.8f} rad\n")
+        f.write(f"theta(T):      {theta[-1]:.8f} rad\n")
+        if coefficients is not None:
+            f.write(f"Coefficients:  {np.array2string(coefficients, precision=8, separator=', ')}\n")
+        f.write("=" * 60 + "\n")
+
+    # 4. Plot Pulse Envelopes
+    pulse_img_path = os.path.join(output_dir, f"pulse_iter_{iteration:03d}.png")
+    fig1, ax1 = plt.subplots(figsize=(7.2, 2.8))
+    ax1.plot(t_grid, Omega_s_mhz, "--", label=r"$\Omega_s$")
+    ax1.plot(t_grid, Omega_p_mhz, "-", label=r"$\Omega_p$")
+    ax1.set_title(f"Iteration {iteration} Rabi Envelopes (Fidelity = {fidelity:.6f})")
+    ax1.set_ylabel("Rabi frequency [MHz]")
+    ax1.set_xlabel("Time [ns]")
+    ax1.set_xlim(float(t_grid[0]), float(t_grid[-1]))
+    peak_val = max(float(np.max(Omega_p_mhz)), float(np.max(Omega_s_mhz)))
+    ax1.set_ylim(0.0, peak_val * 1.1 + 1.0)
+    ax1.legend(loc="upper right")
+    ax1.grid(False)
+    fig1.tight_layout()
+    fig1.savefig(pulse_img_path, dpi=200, bbox_inches="tight")
+    plt.close(fig1)
+
+    # 5. Plot 3-level & other Populations
+    pop_img_path = os.path.join(output_dir, f"populations_iter_{iteration:03d}.png")
+    fig2, ax2 = plt.subplots(figsize=(7.2, 2.8))
+    ax2.plot(t_grid, P0_t, label=r"$p_{|0\rangle}$")
+    ax2.plot(t_grid, P3_t, label=r"$p_{|3\rangle}$")
+    ax2.plot(t_grid, P2_t, label=r"$p_{|2\rangle}$")
+    if np.max(Pother_t) > 1e-4:
+        ax2.plot(t_grid, Pother_t, ":", label=r"$p_{\mathrm{other}}$")
+    ax2.set_title(f"Iteration {iteration} Populations (P2={final_P2:.6f}, P3_max={p3_max:.6f}, P_other={final_Pother:.6f})")
+    ax2.set_xlabel("Time [ns]")
+    ax2.set_ylabel("Population")
+    ax2.set_xlim(float(t_grid[0]), float(t_grid[-1]))
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.legend(loc="center right")
+    ax2.grid(False)
+    fig2.tight_layout()
+    fig2.savefig(pop_img_path, dpi=200, bbox_inches="tight")
+    plt.close(fig2)
+
+    print(
+        f"  [Saved Iteration {iteration}] CSV: {csv_path} | "
+        f"TXT: {txt_path} | Plots: {pulse_img_path}, {pop_img_path}"
+    )
+
+
 def optimize_flat_top_pulse(
     fidelity_fn: Callable[[np.ndarray, np.ndarray, float], float],
     *,
@@ -658,6 +816,9 @@ def optimize_flat_top_pulse(
     optimizer: Callable[..., OptimizationResult] = gradient_ascent,
     optimizer_kwargs: Optional[dict[str, Any]] = None,
     initial_coefficients: Optional[np.ndarray] = None,
+    save_step: int = 1,
+    output_dir: str = "optimization_history",
+    system_cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Build pulse/basis, optimize a_1,...,a_N, and return all useful arrays.
 
@@ -673,7 +834,10 @@ def optimize_flat_top_pulse(
         Function of Omega0/(2*pi) in MHz returning (rise_time_ns, sigma_ns).
     optimizer:
         Optimizer with interface optimizer(objective, x0, **optimizer_kwargs).
-        Replace gradient_ascent with a PSO or other optimizer adapter later.
+    save_step:
+        Save pulse CSV and pulse/population plots every `save_step` iterations (default: 1).
+    output_dir:
+        Directory path where iteration CSV and plots are saved.
     """
     if n_time < max_degree + 2:
         raise ValueError("n_time must be at least max_degree + 2.")
@@ -706,7 +870,24 @@ def optimize_flat_top_pulse(
             raise ValueError("fidelity_fn returned a non-finite value.")
         return value
 
+    def iteration_callback(iter_num: int, coeffs: np.ndarray, current_fid: float) -> None:
+        if save_step > 0 and (iter_num % save_step == 0):
+            _, current_theta = reconstruct_eta_theta(t_ns, Omega, basis, coeffs)
+            save_iteration_data(
+                iteration=iter_num,
+                t_grid=t_ns,
+                Omega=Omega,
+                theta=current_theta,
+                fidelity=current_fid,
+                coefficients=coeffs,
+                output_dir=output_dir,
+                system_cache=system_cache,
+            )
+
     options = {} if optimizer_kwargs is None else dict(optimizer_kwargs)
+    if "callback" not in options:
+        options["callback"] = iteration_callback
+
     opt_result = optimizer(objective, x0, **options)
     eta_opt, theta_opt = reconstruct_eta_theta(t_ns, Omega, basis, opt_result.x)
 
@@ -820,7 +1001,10 @@ if __name__ == "__main__":
 
     # 3. Run optimization with multi-core parallel gradient evaluation
     max_cores = mp.cpu_count()
+    save_step = 1  # Save CSV and plots every save_step iterations (1 = every iteration)
+    history_dir = "optimization_history"
     print(f"Optimizing weighted Legendre pulse coefficients using {max_cores} CPU cores...")
+    print(f"Saving pulse CSV, pulse plot, and 3-level population plot every {save_step} iteration(s) to '{history_dir}'...")
 
     result = optimize_flat_top_pulse(
         fidelity_fn=stirap_fidelity_objective,
@@ -828,6 +1012,9 @@ if __name__ == "__main__":
         omega0_over_2pi_mhz=OMEGA0_OVER_2PI_MHZ,
         max_degree=6,
         n_time=2001,
+        save_step=save_step,
+        output_dir=history_dir,
+        system_cache=system_cache,
         optimizer_kwargs={
             "learning_rate": 0.1,
             "max_iter": 50,
