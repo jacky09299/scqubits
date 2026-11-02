@@ -20,9 +20,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, Optional, Any
+import os
+import sys
+import multiprocessing as mp
+
+# Set thread environment variables before linear algebra libraries load
+# to ensure maximum parallel efficiency across CPU cores in multiprocessing.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import numpy as np
 from numpy.polynomial.legendre import legvander
+from scipy.interpolate import CubicSpline
+import matplotlib.pyplot as plt
+import qutip as qt
+
+# Ensure local modules can be imported
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import fluxonium_bpf as model
 
 
 # ---------------------------------------------------------------------------
@@ -31,6 +49,209 @@ from numpy.polynomial.legendre import legvander
 T_NS = 300.0
 OMEGA0_OVER_2PI_MHZ = 20.0
 OMEGA0_RAD_NS = 2.0 * np.pi * (OMEGA0_OVER_2PI_MHZ * 1e-3)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Physical System Setup and Precomputation Cache
+# ---------------------------------------------------------------------------
+_SYSTEM_CACHE: Optional[dict[str, Any]] = None
+
+
+def get_stirap_system_cache(
+    env_type: str = "transmission_line",
+    T_kelvin: float = 0.030,
+) -> dict[str, Any]:
+    """Initialize and cache the Fluxonium system, transition rates, and collapse operators.
+
+    This ensures system diagonalization and Fermi golden rule rate calculations
+    are performed only once across all optimization iterations and worker processes.
+    """
+    global _SYSTEM_CACHE
+    if _SYSTEM_CACHE is not None and _SYSTEM_CACHE.get("env_type") == env_type and _SYSTEM_CACHE.get("T_kelvin") == T_kelvin:
+        return _SYSTEM_CACHE
+
+    system_data = model.setup_fluxonium_system()
+    N = system_data["N_LEVELS"]
+    if N < 4:
+        raise ValueError("0-3-2 STIRAP requires at least 4 energy levels.")
+
+    EC_J = system_data["EC"] * 1e9 * model.const.h
+    C_sigma = model.const.e**2 / (2.0 * EC_J)
+
+    env_params = {
+        "C_sigma": C_sigma,
+        "Q_cap": 1e6,
+        "Cc": 1.1e-15,
+        "Z0": 50.0,
+        "f_filter_hz": 5.8e9,
+        "bw_hz": 1000e6,
+        "N_order": 6,
+        "g_prods": [0.518, 0.732, 2.732, 3.732, 2.732, 0.732, 0.518],
+        "coupling_stage": 3,
+    }
+
+    rates = model.calculate_transition_rates(
+        system_data=system_data,
+        T_kelvin=T_kelvin,
+        env_type=env_type,
+        params=env_params,
+    )
+
+    c_ops = []
+    for item in rates:
+        initial = int(item["from"])
+        final = int(item["to"])
+        gamma_ns = float(item["rate_mhz"]) * 1e-3
+        if gamma_ns > 0.0:
+            jump_op = qt.basis(N, final) * qt.basis(N, initial).dag()
+            c_ops.append(np.sqrt(gamma_ns) * jump_op)
+
+    H0 = 2.0 * np.pi * system_data["H_qutip"]
+    n_op = system_data["n_qutip"]
+    n_array = n_op.full()
+    E = np.asarray(system_data["evals_ghz"], dtype=float)
+
+    omega_p = 2.0 * np.pi * (E[3] - E[0])  # Pump: 0 <-> 3
+    omega_s = 2.0 * np.pi * (E[3] - E[2])  # Stokes: 2 <-> 3
+
+    n03 = abs(n_array[3, 0])
+    n32 = abs(n_array[3, 2])
+    if n03 < 1e-14 or n32 < 1e-14:
+        raise ValueError(
+            "Matrix elements n03 or n32 are approximately zero; cannot normalize Rabi rates."
+        )
+
+    _SYSTEM_CACHE = {
+        "system_data": system_data,
+        "N": N,
+        "H0": H0,
+        "n_op": n_op,
+        "n_array": n_array,
+        "E": E,
+        "omega_p": omega_p,
+        "omega_s": omega_s,
+        "n03": n03,
+        "n32": n32,
+        "rates": rates,
+        "c_ops": c_ops,
+        "env_type": env_type,
+        "T_kelvin": T_kelvin,
+    }
+    return _SYSTEM_CACHE
+
+
+def simulate_stirap_arbitrary_pulse(
+    t_grid: np.ndarray,
+    Omega_p: np.ndarray,
+    Omega_s: np.ndarray,
+    *,
+    system_cache: Optional[dict[str, Any]] = None,
+    solver_options: Optional[dict[str, Any]] = None,
+    e_ops: Optional[list[Any]] = None,
+) -> qt.Result:
+    """Simulate 0-3-2 STIRAP dynamics under arbitrary pump and Stokes envelopes.
+
+    Omega_p and Omega_s are Rabi frequencies in rad/ns evaluated at t_grid (ns).
+    Continuous driving amplitudes are constructed via CubicSpline interpolation.
+    """
+    if system_cache is None:
+        system_cache = get_stirap_system_cache()
+
+    N = system_cache["N"]
+    H0 = system_cache["H0"]
+    n_op = system_cache["n_op"]
+    omega_p = system_cache["omega_p"]
+    omega_s = system_cache["omega_s"]
+    n03 = system_cache["n03"]
+    n32 = system_cache["n32"]
+    c_ops = system_cache["c_ops"]
+
+    t_grid = np.asarray(t_grid, dtype=float)
+    Omega_p = np.asarray(Omega_p, dtype=float)
+    Omega_s = np.asarray(Omega_s, dtype=float)
+
+    spline_p = CubicSpline(t_grid, Omega_p)
+    spline_s = CubicSpline(t_grid, Omega_s)
+
+    def drive_coefficient(t: float, *unused_args: Any, **unused_kwargs: Any) -> float:
+        # A_pump(t) = Omega_p(t) / n03; A_stokes(t) = Omega_s(t) / n32
+        p_val = float(spline_p(t)) / n03
+        s_val = float(spline_s(t)) / n32
+        return p_val * np.cos(omega_p * t) + s_val * np.cos(omega_s * t)
+
+    H_tot = [H0, [n_op, drive_coefficient]]
+    psi0 = qt.basis(N, 0)
+
+    if e_ops is None:
+        P0 = qt.basis(N, 0).proj()
+        P2 = qt.basis(N, 2).proj()
+        P3 = qt.basis(N, 3).proj()
+        P_other = qt.qeye(N) - P0 - P2 - P3
+        e_ops = [P0, P3, P2, P_other]
+
+    max_omega = max(abs(omega_p), abs(omega_s))
+    carrier_period = 2.0 * np.pi / max_omega
+    # Default solver options matching run_stirap.py
+    default_max_step = min(t_grid[1] - t_grid[0], carrier_period / 1000.0)
+
+    options = {
+        "nsteps": 100000,
+        "max_step": default_max_step,
+        "rtol": 1e-7,
+        "atol": 1e-9,
+    }
+    if solver_options is not None:
+        options.update(solver_options)
+
+    result = qt.mesolve(
+        H_tot,
+        psi0,
+        t_grid,
+        c_ops,
+        e_ops=e_ops,
+        options=options,
+    )
+    return result
+
+
+def calculate_stirap_fidelity(
+    Omega_array: np.ndarray,
+    theta_array: np.ndarray,
+    T_ns: float,
+    *,
+    t_grid: Optional[np.ndarray] = None,
+    system_cache: Optional[dict[str, Any]] = None,
+    solver_options: Optional[dict[str, Any]] = None,
+) -> float:
+    """Calculate the STIRAP fidelity (target state |2> population at t=T).
+
+    Omega_p(t) = Omega(t) * sin(theta(t))
+    Omega_s(t) = Omega(t) * cos(theta(t))
+    """
+    if t_grid is None:
+        t_grid = np.linspace(0.0, T_ns, len(Omega_array))
+
+    Omega_p = Omega_array * np.sin(theta_array)
+    Omega_s = Omega_array * np.cos(theta_array)
+
+    if system_cache is None:
+        system_cache = get_stirap_system_cache()
+
+    N = system_cache["N"]
+    P2 = qt.basis(N, 2).proj()
+
+    result = simulate_stirap_arbitrary_pulse(
+        t_grid=t_grid,
+        Omega_p=Omega_p,
+        Omega_s=Omega_s,
+        system_cache=system_cache,
+        solver_options=solver_options,
+        e_ops=[P2],
+    )
+    p2_t = np.real(np.asarray(result.expect[0]))
+    return float(p2_t[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -255,21 +476,61 @@ class OptimizationResult:
     history: list[dict[str, float]]
 
 
+_PARALLEL_OBJECTIVE: Optional[Callable[[np.ndarray], float]] = None
+
+
+def _parallel_worker_evaluate(point: np.ndarray) -> float:
+    global _PARALLEL_OBJECTIVE
+    if _PARALLEL_OBJECTIVE is None:
+        raise RuntimeError("Global objective was not initialized in worker.")
+    return float(_PARALLEL_OBJECTIVE(point))
+
+
 def finite_difference_gradient(
     objective: Callable[[np.ndarray], float],
     x: np.ndarray,
     relative_step: float = 1e-4,
+    max_workers: Optional[int] = None,
 ) -> np.ndarray:
-    """Central finite-difference gradient of a scalar objective."""
+    """Central finite-difference gradient of a scalar objective with multi-core parallel evaluation."""
+    global _PARALLEL_OBJECTIVE
     x = np.asarray(x, dtype=float)
-    grad = np.zeros_like(x)
-    for i in range(x.size):
-        h = relative_step * max(1.0, abs(float(x[i])))
+    dim = x.size
+    if dim == 0:
+        return np.zeros(0, dtype=float)
+
+    h_list = [relative_step * max(1.0, abs(float(x[i]))) for i in range(dim)]
+    eval_points = []
+    for i in range(dim):
+        h = h_list[i]
         xp = x.copy()
         xm = x.copy()
         xp[i] += h
         xm[i] -= h
-        grad[i] = (float(objective(xp)) - float(objective(xm))) / (2.0 * h)
+        eval_points.append(xp)
+        eval_points.append(xm)
+
+    if max_workers is None:
+        max_workers = mp.cpu_count()
+
+    if max_workers > 1 and len(eval_points) > 1:
+        # Use fork-based pool and a top-level worker function so closures/lambdas
+        # are inherited via copy-on-write without pickling errors.
+        _PARALLEL_OBJECTIVE = objective
+        try:
+            ctx = mp.get_context("fork")
+            with ctx.Pool(processes=max_workers) as pool:
+                vals = pool.map(_parallel_worker_evaluate, eval_points)
+        finally:
+            _PARALLEL_OBJECTIVE = None
+    else:
+        vals = [float(objective(p)) for p in eval_points]
+
+    grad = np.zeros(dim, dtype=float)
+    for i in range(dim):
+        f_plus = vals[2 * i]
+        f_minus = vals[2 * i + 1]
+        grad[i] = (f_plus - f_minus) / (2.0 * h_list[i])
     return grad
 
 
@@ -284,11 +545,12 @@ def gradient_ascent(
     armijo: float = 1e-4,
     backtracking_factor: float = 0.5,
     min_step: float = 1e-8,
+    max_workers: Optional[int] = None,
+    verbose: bool = True,
 ) -> OptimizationResult:
     """Maximize objective using finite-difference gradient ascent + line search.
 
-    This is gradient descent applied to -objective, written as ascent because
-    the quantity of interest (fidelity) is to be maximized.
+    Monitors progress and computes finite-difference gradient in parallel using max CPU cores.
     """
     x = np.asarray(x0, dtype=float).copy()
     if x.ndim != 1:
@@ -296,30 +558,46 @@ def gradient_ascent(
     if learning_rate <= 0.0 or max_iter < 1:
         raise ValueError("learning_rate must be positive and max_iter >= 1.")
 
+    if max_workers is None:
+        max_workers = mp.cpu_count()
+
+    if verbose:
+        print(f"\n[Optimizer] Starting gradient ascent (Workers: {max_workers}, Dim: {x.size}, MaxIter: {max_iter})")
+
     f = float(objective(x))
     history: list[dict[str, float]] = [
         {"iteration": 0.0, "fidelity": f, "gradient_norm": np.nan}
     ]
 
+    if verbose:
+        print(f"[Optimizer] Iteration 0 | Initial Fidelity = {f:.8f} | Coefficients = {x}")
+
     if x.size == 0:
         return OptimizationResult(x, f, 0, True, "No free coefficients (N=0).", history)
 
     for iteration in range(1, max_iter + 1):
-        grad = finite_difference_gradient(objective, x, finite_difference_step)
+        grad = finite_difference_gradient(
+            objective,
+            x,
+            relative_step=finite_difference_step,
+            max_workers=max_workers,
+        )
         grad_norm = float(np.linalg.norm(grad))
         history[-1]["gradient_norm"] = grad_norm
 
         if not np.isfinite(grad_norm):
-            return OptimizationResult(
-                x, f, iteration - 1, False, "Non-finite gradient encountered.", history
-            )
-        if grad_norm <= grad_tol:
-            return OptimizationResult(
-                x, f, iteration - 1, True, "Gradient norm reached tolerance.", history
-            )
+            msg = "Non-finite gradient encountered."
+            if verbose:
+                print(f"[Optimizer] Terminated: {msg}")
+            return OptimizationResult(x, f, iteration - 1, False, msg, history)
 
-        # Normalize the direction so learning_rate is a step length in
-        # coefficient space rather than being strongly dependent on gradient scale.
+        if grad_norm <= grad_tol:
+            msg = "Gradient norm reached tolerance."
+            if verbose:
+                print(f"[Optimizer] Converged: {msg} (||grad|| = {grad_norm:.3e})")
+            return OptimizationResult(x, f, iteration - 1, True, msg, history)
+
+        # Normalize direction
         direction = grad / grad_norm
         directional_derivative = float(np.dot(grad, direction))
         step = learning_rate
@@ -336,10 +614,10 @@ def gradient_ascent(
             step *= backtracking_factor
 
         if not accepted:
-            return OptimizationResult(
-                x, f, iteration - 1, True,
-                "Line search could not find a further improving step.", history
-            )
+            msg = "Line search could not find a further improving step."
+            if verbose:
+                print(f"[Optimizer] Terminated at iteration {iteration}: {msg}")
+            return OptimizationResult(x, f, iteration - 1, True, msg, history)
 
         x = x_trial
         f = f_trial
@@ -351,9 +629,19 @@ def gradient_ascent(
             }
         )
 
-    return OptimizationResult(
-        x, f, max_iter, False, "Reached max_iter before convergence.", history
-    )
+        if verbose:
+            print(
+                f"[Optimizer] Iteration {iteration:3d} | "
+                f"Fidelity = {f:.8f} | "
+                f"||grad|| = {grad_norm:.3e} | "
+                f"Step = {step:.3e} | "
+                f"Coeffs = {np.round(x, 5)}"
+            )
+
+    msg = "Reached max_iter before convergence."
+    if verbose:
+        print(f"[Optimizer] {msg}")
+    return OptimizationResult(x, f, max_iter, False, msg, history)
 
 
 # ---------------------------------------------------------------------------
@@ -446,37 +734,158 @@ def optimize_flat_top_pulse(
 
 
 # ---------------------------------------------------------------------------
-# Example usage (replace example_fidelity with your actual fidelity function)
+# Plotting and Reporting Utilities
+# ---------------------------------------------------------------------------
+def plot_stirap_results(
+    tlist: np.ndarray,
+    Omega_p: np.ndarray,
+    Omega_s: np.ndarray,
+    P0_t: np.ndarray,
+    P3_t: np.ndarray,
+    P2_t: np.ndarray,
+    Pother_t: Optional[np.ndarray] = None,
+    env_type: str = "transmission_line",
+    pulse_filename: Optional[str] = None,
+    pop_filename: Optional[str] = None,
+) -> None:
+    """Plot and save Rabi frequency envelopes and population transfer dynamics.
+
+    Matches the publication-quality plotting format of run_stirap.py.
+    """
+    if pulse_filename is None:
+        pulse_filename = f"stirap_rabi_pulses_{env_type}.png"
+    if pop_filename is None:
+        pop_filename = f"stirap_populations_{env_type}.png"
+
+    # Convert rad/ns to MHz
+    Omega_p_mhz = Omega_p / (2.0 * np.pi * 1e-3)
+    Omega_s_mhz = Omega_s / (2.0 * np.pi * 1e-3)
+    peak_val = max(float(np.max(Omega_p_mhz)), float(np.max(Omega_s_mhz)))
+
+    # Plot 1: Rabi-frequency envelopes
+    fig1, ax1 = plt.subplots(figsize=(7.2, 2.8))
+    ax1.plot(tlist, Omega_s_mhz, "--", label=r"$\Omega_s$")
+    ax1.plot(tlist, Omega_p_mhz, "-", label=r"$\Omega_p$")
+    ax1.set_ylabel("Rabi frequency [MHz]")
+    ax1.set_xlabel("Time [ns]")
+    ax1.set_xlim(float(tlist[0]), float(tlist[-1]))
+    ax1.set_ylim(0.0, peak_val * 1.1 + 1.0)
+    ax1.legend(loc="upper right")
+    ax1.grid(False)
+    fig1.tight_layout()
+    fig1.savefig(pulse_filename, dpi=300, bbox_inches="tight")
+    plt.close(fig1)
+
+    # Plot 2: Population transfer
+    fig2, ax2 = plt.subplots(figsize=(7.2, 2.8))
+    ax2.plot(tlist, P0_t, label=r"$p_{|0\rangle}$")
+    ax2.plot(tlist, P3_t, label=r"$p_{|3\rangle}$")
+    ax2.plot(tlist, P2_t, label=r"$p_{|2\rangle}$")
+    if Pother_t is not None and np.max(Pother_t) > 1e-4:
+        ax2.plot(tlist, Pother_t, ":", label=r"$p_{\mathrm{other}}$")
+    ax2.set_xlabel("Time [ns]")
+    ax2.set_ylabel("Population")
+    ax2.set_xlim(float(tlist[0]), float(tlist[-1]))
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.legend(loc="center right")
+    ax2.grid(False)
+    fig2.tight_layout()
+    fig2.savefig(pop_filename, dpi=300, bbox_inches="tight")
+    plt.close(fig2)
+
+    print(f"\nSaved figures:\n  {pulse_filename}\n  {pop_filename}")
+
+
+# ---------------------------------------------------------------------------
+# Main Execution Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    def example_fidelity(Omega: np.ndarray, theta: np.ndarray, T: float) -> float:
-        """A dummy objective for smoke-testing only; not a physics fidelity."""
-        target = 0.5 * np.pi * np.linspace(0.0, 1.0, theta.size)
-        return float(-np.mean((theta - target) ** 2))
+    print("=" * 70)
+    print("0-3-2 STIRAP WEIGHTED LEGENDRE PULSE OPTIMIZATION")
+    print("=" * 70)
+
+    # 1. Initialize physical system
+    system_cache = get_stirap_system_cache(env_type="transmission_line", T_kelvin=0.030)
+    print(f"System initialized with N = {system_cache['N']} levels.")
+    print(f"Number of collapse operators = {len(system_cache['c_ops'])}")
+
+    # 2. Setup fidelity objective for STIRAP
+    def stirap_fidelity_objective(Omega: np.ndarray, theta: np.ndarray, T: float) -> float:
+        return calculate_stirap_fidelity(
+            Omega_array=Omega,
+            theta_array=theta,
+            T_ns=T,
+            system_cache=system_cache,
+        )
+
+    # 3. Run optimization with multi-core parallel gradient evaluation
+    max_cores = mp.cpu_count()
+    print(f"Optimizing weighted Legendre pulse coefficients using {max_cores} CPU cores...")
 
     result = optimize_flat_top_pulse(
-        fidelity_fn=example_fidelity,
+        fidelity_fn=stirap_fidelity_objective,
         T_ns=T_NS,
         omega0_over_2pi_mhz=OMEGA0_OVER_2PI_MHZ,
         max_degree=6,
         n_time=2001,
-        optimizer_kwargs={"learning_rate": 0.2, "max_iter": 100},
+        optimizer_kwargs={
+            "learning_rate": 0.1,
+            "max_iter": 50,
+            "max_workers": max_cores,
+            "verbose": True,
+        },
     )
 
-    print(f"Omega0/(2pi) = {OMEGA0_OVER_2PI_MHZ:.3f} MHz")
-    print(f"Omega0 = {result['omega0_rad_ns']:.8f} rad/ns")
-    print(f"T = {T_NS:.1f} ns")
-    print(
-        "Gaussian ramp: "
-        f"rise_time={result['rise_time_ns']:.3f} ns, "
-        f"sigma={result['sigma_ns']:.3f} ns"
+    t_grid = result["t_ns"]
+    Omega_opt = result["Omega"]
+    theta_opt = result["theta"]
+
+    Omega_p_opt = Omega_opt * np.sin(theta_opt)
+    Omega_s_opt = Omega_opt * np.cos(theta_opt)
+
+    print("\n" + "=" * 70)
+    print("OPTIMIZATION RESULTS SUMMARY")
+    print("=" * 70)
+    print(f"Omega0/(2pi)             = {OMEGA0_OVER_2PI_MHZ:.3f} MHz")
+    print(f"Pulse duration T         = {T_NS:.1f} ns")
+    print(f"Final Optimized Fidelity = {result['fidelity']:.6f}")
+    print(f"Optimal Coefficients     = {np.round(result['coefficients'], 6)}")
+    print(f"theta(0)                 = {theta_opt[0]:.6f} rad")
+    print(f"theta(T)                 = {result['theta_T']:.6f} rad (expected pi/2 = {np.pi/2:.6f})")
+    print(f"Endpoint constraint      = {result['endpoint_constraint_value']:.8f}")
+
+    # 4. Simulate full time-evolution dynamics with optimized pulses
+    print("\nSimulating full time-dependent population dynamics...")
+    P0 = qt.basis(system_cache["N"], 0).proj()
+    P2 = qt.basis(system_cache["N"], 2).proj()
+    P3 = qt.basis(system_cache["N"], 3).proj()
+    P_other = qt.qeye(system_cache["N"]) - P0 - P2 - P3
+
+    sim_res = simulate_stirap_arbitrary_pulse(
+        t_grid=t_grid,
+        Omega_p=Omega_p_opt,
+        Omega_s=Omega_s_opt,
+        system_cache=system_cache,
+        e_ops=[P0, P3, P2, P_other],
     )
-    print(f"W = {result['W']:.8f}")
-    print(f"Optimized fidelity (dummy) = {result['fidelity']:.10f}")
-    print(f"Coefficients a_1,...,a_N = {result['coefficients']}")
-    print(f"Integral constraint = {result['endpoint_constraint_value']:.12f}")
-    print(f"theta(T) = {result['theta_T']:.12f} rad")
-    print(
-        "Weighted orthogonality max error = "
-        f"{result['basis_data']['orthogonality_error']:.3e}"
+
+    P0_t, P3_t, P2_t, Pother_t = [np.real(np.asarray(x)) for x in sim_res.expect]
+
+    print("\nSTIRAP Simulation Results:")
+    print(f"Final P0      = {P0_t[-1]:.6f}")
+    print(f"Final P3      = {P3_t[-1]:.6f}")
+    print(f"Final P2      = {P2_t[-1]:.6f}  (Target Fidelity)")
+    print(f"Final P_other = {Pother_t[-1]:.6f}")
+    print(f"Maximum P3    = {np.max(P3_t):.6f}")
+
+    # 5. Generate and save plots
+    plot_stirap_results(
+        tlist=t_grid,
+        Omega_p=Omega_p_opt,
+        Omega_s=Omega_s_opt,
+        P0_t=P0_t,
+        P3_t=P3_t,
+        P2_t=P2_t,
+        Pother_t=Pother_t,
+        env_type=system_cache["env_type"],
     )
