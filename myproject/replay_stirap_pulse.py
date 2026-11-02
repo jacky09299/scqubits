@@ -1,9 +1,18 @@
 """Replay STIRAP pulse from CSV with customizable environment and temperature.
 
+Supports two pulse loading modes:
+1. Direct CSV replay: Reads Omega_p and Omega_s directly from the CSV columns.
+2. Coefficient-based replay: Reads Omega(t) and time grid from CSV, and reconstructs
+   theta(t) and the pulse envelopes using manually provided Legendre coefficients:
+       Omega_p(t) = Omega(t) * sin(theta(t))
+       Omega_s(t) = Omega(t) * cos(theta(t))
+
 Usage:
-    python replay_stirap_pulse.py
+    # Mode 1: Direct replay from CSV
     python replay_stirap_pulse.py --csv optimization_history/pulse_iter_000.csv --env multi_stage_bpf --temp 0.030
-    python replay_stirap_pulse.py --csv optimization_history/pulse_iter_000.csv --env transmission_line --temp 0.010
+
+    # Mode 2: Reconstruct using copied coefficients
+    python replay_stirap_pulse.py --csv optimization_history/pulse_iter_000.csv --coeffs "-0.00633, 0.0496, 0.0, 0.0, 0.0, 0.0" --env multi_stage_bpf --temp 0.030
 """
 
 from __future__ import annotations
@@ -23,14 +32,24 @@ import fluxonium_bpf as model
 from weighted_legendre_pulse_optimization import (
     simulate_stirap_arbitrary_pulse,
     plot_stirap_results,
+    build_weighted_legendre_basis,
+    reconstruct_eta_theta,
 )
 
 
-def load_pulse_csv(csv_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_pulse_csv(
+    csv_path: str,
+    coefficients: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
     """Load time and Rabi frequencies (in rad/ns) from a saved pulse CSV file.
 
+    If `coefficients` is provided, Omega(t) is extracted from the CSV and
+    theta(t) is reconstructed using the weighted Legendre basis:
+        Omega_p(t) = Omega(t) * sin(theta(t))
+        Omega_s(t) = Omega(t) * cos(theta(t))
+
     Returns:
-        (t_grid, Omega_p_rad_ns, Omega_s_rad_ns)
+        (t_grid, Omega_p_rad_ns, Omega_s_rad_ns, Omega_rad_ns, theta_rad)
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Pulse CSV file not found: {csv_path}")
@@ -52,7 +71,27 @@ def load_pulse_csv(csv_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     else:
         t_grid = data[:, 0]
 
-    # Extract Omega_p
+    # Extract base envelope Omega
+    if "Omega_rad_ns" in col_map:
+        omega_base = data[:, col_map["Omega_rad_ns"]]
+    elif "Omega_mhz" in col_map:
+        omega_base = data[:, col_map["Omega_mhz"]] * (2.0 * np.pi * 1e-3)
+    else:
+        omega_base = None
+
+    # If coefficients are provided, reconstruct theta and pulse envelopes
+    if coefficients is not None and len(coefficients) > 0:
+        if omega_base is None:
+            raise ValueError("CSV must contain 'Omega_rad_ns' or 'Omega_mhz' to reconstruct from coefficients.")
+        coeffs = np.asarray(coefficients, dtype=float)
+        max_deg = len(coeffs)
+        basis = build_weighted_legendre_basis(t_grid, omega_base, max_deg)
+        _, theta = reconstruct_eta_theta(t_grid, omega_base, basis, coeffs)
+        omega_p = omega_base * np.sin(theta)
+        omega_s = omega_base * np.cos(theta)
+        return t_grid, omega_p, omega_s, omega_base, theta
+
+    # Otherwise read existing Omega_p and Omega_s from CSV
     if "Omega_p_rad_ns" in col_map:
         omega_p = data[:, col_map["Omega_p_rad_ns"]]
     elif "Omega_p_mhz" in col_map:
@@ -60,7 +99,6 @@ def load_pulse_csv(csv_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     else:
         raise KeyError("Could not find 'Omega_p_rad_ns' or 'Omega_p_mhz' column in CSV.")
 
-    # Extract Omega_s
     if "Omega_s_rad_ns" in col_map:
         omega_s = data[:, col_map["Omega_s_rad_ns"]]
     elif "Omega_s_mhz" in col_map:
@@ -68,7 +106,11 @@ def load_pulse_csv(csv_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     else:
         raise KeyError("Could not find 'Omega_s_rad_ns' or 'Omega_s_mhz' column in CSV.")
 
-    return t_grid, omega_p, omega_s
+    theta = data[:, col_map["theta_rad"]] if "theta_rad" in col_map else np.arctan2(omega_p, omega_s)
+    if omega_base is None:
+        omega_base = np.sqrt(omega_p**2 + omega_s**2)
+
+    return t_grid, omega_p, omega_s, omega_base, theta
 
 
 def build_system_cache(
@@ -152,19 +194,42 @@ def replay_stirap_simulation(
     csv_path: str,
     env_type: str = "multi_stage_bpf",
     T_kelvin: float = 0.030,
+    coefficients: Optional[np.ndarray | list[float] | str] = None,
     output_prefix: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Run STIRAP simulation with loaded CSV pulse envelopes under chosen environment & temperature."""
+    """Run STIRAP simulation with loaded CSV pulse envelopes under chosen environment & temperature.
+
+    Parameters:
+        csv_path: Path to pulse CSV file.
+        env_type: 'multi_stage_bpf', 'transmission_line', or 'uncoupled'.
+        T_kelvin: Temperature in Kelvin (e.g. 0.030 for 30 mK).
+        coefficients: Optional Legendre coefficients (array, list, or comma-separated string).
+                      If supplied, theta(t) and pulse envelopes are reconstructed from Omega(t).
+        output_prefix: Output file prefix for generated figures and text reports.
+    """
+    if isinstance(coefficients, str):
+        # Parse string like "-0.00633, 0.0496, 0.0"
+        coeff_list = [float(x.strip()) for x in coefficients.split(",") if x.strip()]
+        coeffs_arr = np.asarray(coeff_list, dtype=float)
+    elif coefficients is not None:
+        coeffs_arr = np.asarray(coefficients, dtype=float)
+    else:
+        coeffs_arr = None
+
     print("=" * 70)
     print("REPLAY STIRAP PULSE SIMULATION")
     print("=" * 70)
     print(f"Loading pulse from: {csv_path}")
+    if coeffs_arr is not None:
+        print(f"Reconstructing pulse using {len(coeffs_arr)} coefficients: {np.round(coeffs_arr, 6)}")
+    else:
+        print("Using pulse envelopes directly from CSV columns.")
     print(f"Target Environment: {env_type}")
     print(f"Target Temperature: {T_kelvin * 1e3:.1f} mK ({T_kelvin} K)")
 
-    # 1. Load pulse envelopes
-    t_grid, omega_p, omega_s = load_pulse_csv(csv_path)
-    print(f"Pulse loaded: {len(t_grid)} points from {t_grid[0]:.2f} ns to {t_grid[-1]:.2f} ns.")
+    # 1. Load / reconstruct pulse envelopes
+    t_grid, omega_p, omega_s, omega_base, theta = load_pulse_csv(csv_path, coefficients=coeffs_arr)
+    print(f"Pulse ready: {len(t_grid)} points from {t_grid[0]:.2f} ns to {t_grid[-1]:.2f} ns.")
 
     # 2. Build system with new environment and temperature
     system_cache = build_system_cache(env_type=env_type, T_kelvin=T_kelvin)
@@ -230,6 +295,8 @@ def replay_stirap_simulation(
         f.write("STIRAP PULSE REPLAY RESULTS\n")
         f.write("=" * 60 + "\n")
         f.write(f"Source CSV:    {csv_path}\n")
+        if coeffs_arr is not None:
+            f.write(f"Coefficients:  {np.array2string(coeffs_arr, precision=8, separator=', ')}\n")
         f.write(f"Environment:   {env_type}\n")
         f.write(f"Temperature:   {T_kelvin * 1e3:.1f} mK ({T_kelvin} K)\n")
         f.write(f"Fidelity (P2): {final_P2:.8f}\n")
@@ -284,6 +351,13 @@ if __name__ == "__main__":
         help="Path to pulse CSV file (default: latest pulse_iter_*.csv in optimization_history/)",
     )
     parser.add_argument(
+        "--coeffs",
+        type=str,
+        default=None,
+        help="Legendre pulse coefficients as comma-separated floats, e.g. '-0.00633, 0.0496, 0.0' (optional). "
+             "If omitted, uses Omega_p and Omega_s directly from CSV.",
+    )
+    parser.add_argument(
         "--env",
         type=str,
         default="multi_stage_bpf",
@@ -310,5 +384,6 @@ if __name__ == "__main__":
         csv_path=csv_file,
         env_type=args.env,
         T_kelvin=args.temp,
+        coefficients=args.coeffs,
         output_prefix=args.out,
     )
