@@ -480,6 +480,11 @@ class OptimizationResult:
 _PARALLEL_OBJECTIVE: Optional[Callable[[np.ndarray], float]] = None
 
 
+def _parallel_worker_init(objective: Callable[[np.ndarray], float]) -> None:
+    global _PARALLEL_OBJECTIVE
+    _PARALLEL_OBJECTIVE = objective
+
+
 def _parallel_worker_evaluate(point: np.ndarray) -> float:
     global _PARALLEL_OBJECTIVE
     if _PARALLEL_OBJECTIVE is None:
@@ -494,8 +499,9 @@ def parallel_evaluate_points(
 ) -> list[float]:
     """Cross-platform parallel evaluation of an objective function over a list of points.
 
-    Supports both POSIX systems (Linux, macOS via 'fork') and Windows (via thread pool
-    or fallback) seamlessly, avoiding platform-specific context errors.
+    SciPy's ODEPACK (zvode) uses Fortran static COMMON blocks and is NOT thread-safe
+    across multiple threads in a single process. Therefore, true multiprocessing
+    (fork on Linux/macOS, spawn on Windows) MUST be used rather than multi-threading.
     """
     global _PARALLEL_OBJECTIVE
     if max_workers is None:
@@ -505,7 +511,8 @@ def parallel_evaluate_points(
         return [float(objective(p)) for p in points]
 
     available_methods = mp.get_all_start_methods()
-    # On Linux and macOS, 'fork' allows fast copy-on-write without pickling issues
+
+    # 1. On Linux and macOS, 'fork' is fast and inherits memory via copy-on-write
     if "fork" in available_methods:
         try:
             _PARALLEL_OBJECTIVE = objective
@@ -517,13 +524,42 @@ def parallel_evaluate_points(
         finally:
             _PARALLEL_OBJECTIVE = None
 
-    # On Windows or systems where fork is unavailable/fails, use multi-threading
-    # which works on Windows without process spawning or pickling limitations.
+    # 2. On Windows (or when fork is unavailable), use 'spawn' process pool
+    # with a top-level initializer to avoid thread-safety violations in zvode.
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            return list(executor.map(objective, points))
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=max_workers, initializer=_parallel_worker_init, initargs=(objective,)) as pool:
+            return pool.map(_parallel_worker_evaluate, points)
     except Exception:
-        return [float(objective(p)) for p in points]
+        pass
+
+    # 3. Fallback: sequential execution (safe against ODEPACK concurrency bugs)
+    return [float(objective(p)) for p in points]
+
+
+class LegendrePulseObjective:
+    """Picklable objective callable for multi-process optimization across platforms."""
+
+    def __init__(
+        self,
+        t_ns: np.ndarray,
+        Omega: np.ndarray,
+        basis: dict[str, Any],
+        fidelity_fn: Callable[[np.ndarray, np.ndarray, float], float],
+        T_ns: float,
+    ) -> None:
+        self.t_ns = t_ns
+        self.Omega = Omega
+        self.basis = basis
+        self.fidelity_fn = fidelity_fn
+        self.T_ns = T_ns
+
+    def __call__(self, coefficients: np.ndarray) -> float:
+        _, theta = reconstruct_eta_theta(self.t_ns, self.Omega, self.basis, coefficients)
+        value = float(self.fidelity_fn(self.Omega, theta, self.T_ns))
+        if not np.isfinite(value):
+            raise ValueError("fidelity_fn returned a non-finite value.")
+        return value
 
 
 def finite_difference_gradient(
@@ -863,12 +899,13 @@ def optimize_flat_top_pulse(
                 f"initial_coefficients must have shape ({max_degree},), got {x0.shape}."
             )
 
-    def objective(coefficients: np.ndarray) -> float:
-        _, theta = reconstruct_eta_theta(t_ns, Omega, basis, coefficients)
-        value = float(fidelity_fn(Omega, theta, T_ns))
-        if not np.isfinite(value):
-            raise ValueError("fidelity_fn returned a non-finite value.")
-        return value
+    objective = LegendrePulseObjective(
+        t_ns=t_ns,
+        Omega=Omega,
+        basis=basis,
+        fidelity_fn=fidelity_fn,
+        T_ns=T_ns,
+    )
 
     def iteration_callback(iter_num: int, coeffs: np.ndarray, current_fid: float) -> None:
         if save_step > 0 and (iter_num % save_step == 0):
@@ -978,6 +1015,26 @@ def plot_stirap_results(
 
 
 # ---------------------------------------------------------------------------
+# Global Picklable STIRAP Fidelity Objective
+# ---------------------------------------------------------------------------
+class StirapFidelityObjective:
+    """Picklable STIRAP fidelity evaluator for cross-platform multiprocessing (spawn)."""
+
+    def __init__(self, env_type: str = "transmission_line", T_kelvin: float = 0.030) -> None:
+        self.env_type = env_type
+        self.T_kelvin = T_kelvin
+
+    def __call__(self, Omega: np.ndarray, theta: np.ndarray, T: float) -> float:
+        cache = get_stirap_system_cache(env_type=self.env_type, T_kelvin=self.T_kelvin)
+        return calculate_stirap_fidelity(
+            Omega_array=Omega,
+            theta_array=theta,
+            T_ns=T,
+            system_cache=cache,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main Execution Entrypoint
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -990,14 +1047,8 @@ if __name__ == "__main__":
     print(f"System initialized with N = {system_cache['N']} levels.")
     print(f"Number of collapse operators = {len(system_cache['c_ops'])}")
 
-    # 2. Setup fidelity objective for STIRAP
-    def stirap_fidelity_objective(Omega: np.ndarray, theta: np.ndarray, T: float) -> float:
-        return calculate_stirap_fidelity(
-            Omega_array=Omega,
-            theta_array=theta,
-            T_ns=T,
-            system_cache=system_cache,
-        )
+    # 2. Setup picklable fidelity objective for STIRAP
+    stirap_fidelity_objective = StirapFidelityObjective(env_type="transmission_line", T_kelvin=0.030)
 
     # 3. Run optimization with multi-core parallel gradient evaluation
     max_cores = mp.cpu_count()
