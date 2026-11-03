@@ -1052,13 +1052,14 @@ def optimize_stirap_with_iterative_omega(
     omega0_rad_ns = 2.0 * np.pi * (omega0_over_2pi_mhz * 1e-3)
     rise_time_ns, sigma_ns = ramp_calibration(omega0_over_2pi_mhz)
 
-    current_Omega = flat_top_gaussian_envelope(
+    Omega_base = flat_top_gaussian_envelope(
         t_ns=t_ns,
         T_ns=T_ns,
         omega0_rad_ns=omega0_rad_ns,
         rise_time_ns=rise_time_ns,
         sigma_ns=sigma_ns,
     )
+    current_Omega = Omega_base.copy()
 
     outer_results: list[dict[str, Any]] = []
 
@@ -1105,18 +1106,18 @@ def optimize_stirap_with_iterative_omega(
 
         print(f">>> [Round {outer_idx + 1:02d} Completed] Fidelity = {round_result['fidelity']:.8f}")
 
-        # Update Omega for the next round using the formula
+        # Update Omega for the next round by applying the correction formula to Omega_base
         if outer_idx < n_outer_iterations - 1:
             new_Omega = update_omega_from_theta(
-                Omega=current_Omega,
+                Omega=Omega_base,
                 theta=current_theta,
                 n03=n03,
                 n32=n32,
             )
-            # Log change in Omega envelope
+            # Log change in Omega envelope compared to previous round
             max_diff = float(np.max(np.abs(new_Omega - current_Omega)))
             rel_diff = max_diff / float(np.max(current_Omega))
-            print(f">>> [Omega Updated] max|Omega_new - Omega_old| = {max_diff:.4e} rad/ns (relative {rel_diff*100:.2f}%)")
+            print(f">>> [Omega Updated from Base] max|Omega_new - Omega_old| = {max_diff:.4e} rad/ns (relative {rel_diff*100:.2f}%)")
             current_Omega = new_Omega
 
     last_res = outer_results[-1]["result"]
