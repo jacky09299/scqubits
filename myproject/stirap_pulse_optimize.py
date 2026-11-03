@@ -499,6 +499,24 @@ def reconstruct_eta_theta(
     return eta, theta
 
 
+def project_eta_to_basis(
+    eta_prev: np.ndarray,
+    basis_new: dict[str, Any],
+) -> np.ndarray:
+    """Project an existing eta(t) envelope onto a new weighted Legendre basis.
+
+    This preserves the pulse shape and high fidelity across outer iteration rounds
+    when Omega(t) is updated and the basis is reconstructed:
+        a_n = <phi_n^{new}, eta_{prev}>_{Omega_{new}}
+    """
+    Phi = basis_new["Phi"]
+    weighted_measure = basis_new["weighted_measure"]
+    # Phi[:, 1:] has shape (n_time, N_free)
+    # Project eta_prev onto phi_1,...,phi_N using inner product with weighted_measure
+    coeffs = Phi[:, 1:].T @ (weighted_measure * np.asarray(eta_prev, dtype=float))
+    return coeffs
+
+
 # ---------------------------------------------------------------------------
 # Optimizers: objective is maximized. Add alternative optimizers with the
 # same call signature to make replacing gradient ascent straightforward.
@@ -712,8 +730,9 @@ def gradient_ascent(
         while step >= min_step:
             x_trial = x + step * direction
             f_trial = float(objective(x_trial))
-            if np.isfinite(f_trial) and f_trial >= (
-                f + armijo * step * directional_derivative
+            # Accept if strictly improving or satisfies Armijo condition
+            if np.isfinite(f_trial) and (
+                f_trial >= (f + armijo * step * directional_derivative) or f_trial > f
             ):
                 accepted = True
                 break
@@ -1060,6 +1079,8 @@ def optimize_stirap_with_iterative_omega(
         sigma_ns=sigma_ns,
     )
     current_Omega = Omega_base.copy()
+    current_coeffs: Optional[np.ndarray] = None
+    prev_eta: Optional[np.ndarray] = None
 
     outer_results: list[dict[str, Any]] = []
 
@@ -1078,6 +1099,15 @@ def optimize_stirap_with_iterative_omega(
         print(f"\n>>> [Round {outer_idx + 1:02d}/{n_outer_iterations:02d}] {stage_name} "
               f"(max_iter={stage_kwargs.get('max_iter', 50)}, grad_tol={stage_kwargs.get('grad_tol', 1e-7)})")
 
+        # In round 0, start from zeros.
+        # In later rounds, warm-start with coefficients projected from previous round's optimal eta.
+        if outer_idx == 0 or prev_eta is None:
+            init_coeffs = np.zeros(max_degree, dtype=float)
+        else:
+            temp_basis = build_weighted_legendre_basis(t_ns, current_Omega, max_degree)
+            init_coeffs = project_eta_to_basis(prev_eta, temp_basis)
+            print(f">>> [Warm-start] Projected coefficients from previous round: {np.round(init_coeffs, 5)}")
+
         round_result = optimize_flat_top_pulse(
             fidelity_fn=fidelity_fn,
             Omega_initial=current_Omega,
@@ -1088,19 +1118,23 @@ def optimize_stirap_with_iterative_omega(
             ramp_calibration=ramp_calibration,
             optimizer=optimizer,
             optimizer_kwargs=stage_kwargs,
-            initial_coefficients=np.zeros(max_degree, dtype=float),
+            initial_coefficients=init_coeffs,
             save_step=save_step,
             output_dir=round_dir,
             system_cache=system_cache,
         )
 
         current_theta = round_result["theta"]
+        prev_eta = round_result["eta"]
+        current_coeffs = round_result["coefficients"]
+
         outer_results.append({
             "round": outer_idx + 1,
             "stage": stage_name,
             "fidelity": round_result["fidelity"],
             "Omega": current_Omega.copy(),
             "theta": current_theta.copy(),
+            "coefficients": current_coeffs.copy(),
             "result": round_result,
         })
 
